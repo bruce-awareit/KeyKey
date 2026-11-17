@@ -101,6 +101,10 @@ def verify_source_hashes(manifest: dict[str, object], manifest_path: Path) -> di
     frequencies = sources.get("cin_reading_frequencies")
     if frequencies:
         checks.append((bigram / frequencies["file"], frequencies["sha256"]))
+    weights = sources.get("standalone_composition_weights")
+    if weights:
+        checks.append((bigram.parent.parent / weights["file"], weights["sha256"]))
+        checks.append((bigram.parent.parent / weights["selection_file"], weights["selection_sha256"]))
     phrase = sources.get("phrase_unigram_supplement")
     if phrase:
         checks.append((bigram / phrase["file"], phrase["sha256"]))
@@ -149,13 +153,48 @@ def verify_manifest(path: Path, manifest_path: Path) -> dict[str, object]:
     pending_inputs = verify_source_hashes(manifest, manifest_path)
     with connect_readonly(path) as database:
         validate_schema(database)
+        weights_source = manifest["sources"].get("standalone_composition_weights")
+        weights = None
+        cin_overrides = set()
+        if weights_source:
+            from standalone_composition_weights import load, verify
+            weights_path = manifest_path.parent.parent.parent / weights_source["file"]
+            cin_overrides = {tuple(key) for key in weights_source["cin_overrides"]}
+            # A rejected rebuild can leave a newer editable source beside the verified DB.
+            # In that case the canonical DB hash still verifies the previously accepted rows.
+            if file_sha256(weights_path) == weights_source["sha256"]:
+                weights = load(weights_path, manifest["unigram_total_count"])
+                if (weights["selection_sha256"] != weights_source["selection_sha256"]
+                        or len(weights["unigrams"]) != weights_source["unigram_upserts"]
+                        or len(weights["bigrams"]) != weights_source["bigram_upserts"]):
+                    raise ValueError("reviewed composition weight metadata differs from its source")
+                verify(database, weights)
+        phrase_source = manifest["sources"].get("phrase_unigram_supplement")
+        post_training_additions = set()
+        if phrase_source and phrase_source.get("post_training_entries"):
+            from phrase_unigram_supplement import verify_post_training
+            phrase_path = manifest_path.parent / phrase_source["file"]
+            if file_sha256(phrase_path) == phrase_source["sha256"]:
+                post_training_additions = verify_post_training(
+                    database, phrase_path, manifest["unigram_total_count"], phrase_source["post_training_entries"]
+                )
+            else:
+                # A pending rebuild can leave a newer source beside the verified canonical DB.
+                post_training_additions = None
         frequencies = manifest["sources"].get("cin_reading_frequencies")
         if frequencies:
             from cin_reading_frequencies import load, verify_unigrams
             entries = load(manifest_path.parent / frequencies["file"])
             if len(entries) != frequencies["entries"]:
                 raise ValueError("CIN frequency source entry count changed")
-            verify_unigrams(database, entries, manifest["unigram_total_count"])
+            cin_keys = {(row["qstring"], row["character"]) for row in entries}
+            if weights is not None:
+                expected = cin_keys.intersection(tuple(row["key"]) for row in weights["unigrams"])
+                if cin_overrides != expected:
+                    raise ValueError("reviewed CIN frequency overrides differ from the weight source")
+            verify_unigrams(database, [row for row in entries
+                            if (row["qstring"], row["character"]) not in cin_overrides],
+                            manifest["unigram_total_count"])
         missing_phonetic = database.execute('''
             SELECT qstring,current FROM (
                 SELECT qstring,current,ROW_NUMBER() OVER (
@@ -202,6 +241,7 @@ def verify_manifest(path: Path, manifest_path: Path) -> dict[str, object]:
                 if len(matches) != 1 or not math.isclose(matches[0][0], expected, rel_tol=0, abs_tol=1e-12) or (not collection.get("cooked") and matches[0][1] != 0):
                     raise ValueError(f"collection list entry differs from DB: {row['word']}")
         if rebuild.get("cooker_report_file"):
+            from phrase_unigram_supplement import query_for_reading
             from unigram_collisions import CollisionIndex
             index = CollisionIndex(manifest_path.parent.parent / "McBopomofo/phrase.occ",
                                    manifest_path.parent.parent / "McBopomofo/BPMFMappings.txt")
@@ -224,15 +264,27 @@ def verify_manifest(path: Path, manifest_path: Path) -> dict[str, object]:
             bigram_words = {word for pair in database.execute("SELECT DISTINCT previous,current FROM bigrams") for word in pair}
             for row in convenience:
                 score = math.log10(float(row["target_count"]) / manifest["unigram_total_count"])
-                actual = database.execute("SELECT probability,backoff,qstring FROM unigrams WHERE current=?", (row["word"],)).fetchall()
-                if len(actual) != 1 or not math.isclose(actual[0][0], score, abs_tol=1e-12) or actual[0][1] != 0:
+                query = "".join(query_for_reading(value) for value in row["reading"].split())
+                actual = database.execute("SELECT probability,backoff,qstring FROM unigrams WHERE current=?",
+                                          (row["word"],)).fetchall()
+                original = [(probability, backoff) for probability, backoff, key in actual if key == query]
+                if len(original) != 1 or not math.isclose(original[0][0], score, abs_tol=1e-12) or original[0][1] != 0:
                     raise ValueError(f"convenience score mismatch: {row['word']}")
                 limit = 1 if row["word"] in people_words and row["word"] not in low_ranked_words else 0.01
+                maximum_score = math.log10(limit / manifest["unigram_total_count"])
                 if float(row["target_count"]) > limit:
                     raise ValueError(f"convenience word exceeds low-frequency limit: {row['word']}")
-                for other, probability in database.execute("SELECT current,probability FROM unigrams WHERE qstring=?", (actual[0][2],)):
-                    if other not in convenience_words and score > probability - 2.0 + 1e-12:
-                        raise ValueError(f"convenience word outranks ordinary homophone: {row['word']} / {other}")
+                for probability, backoff, key in actual:
+                    if (key != query and post_training_additions is not None
+                            and (key, row["word"]) not in post_training_additions):
+                        raise ValueError(f"undeclared convenience reading: {row['word']}")
+                    if backoff != 0 or probability > maximum_score + 1e-12:
+                        raise ValueError(f"convenience reading exceeds low-frequency limit: {row['word']}")
+                    for other, other_score in database.execute(
+                        "SELECT current,probability FROM unigrams WHERE qstring=?", (key,)
+                    ):
+                        if other not in convenience_words and probability > other_score - 2.0 + 1e-12:
+                            raise ValueError(f"convenience word outranks ordinary homophone: {row['word']} / {other}")
                 if row["word"] in bigram_words:
                     raise ValueError(f"convenience word has Bigram edges: {row['word']}")
         integrity = database.execute("PRAGMA integrity_check").fetchone()[0]

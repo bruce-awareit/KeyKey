@@ -16,9 +16,11 @@ Workflow：`.github/workflows/rebuild-keykey-db.yml`。
 | --- | --- |
 | `DataSource/chichi77Collection/phrase.*.tsv` | 分類詞庫原詞、讀音、分類與來源詞頻 |
 | `DataSource/CINReadingFrequency/cin-character-reading-frequencies.tsv` | 預設啟用的 CIN 逐字讀音替代詞頻，可明確關閉 |
+| `DataSource/CINReadingFrequency/standalone-composition-review.tsv`、`standalone-composition-weights.json` | 單音節指定組字的審閱權重 |
+| `DataSource/AISyntheticArticles/typing-articles-v[234].jsonl` | Bigram 訓練正文，內嵌人名範圍 |
 | `DataSource/AssociatedPhraseCollectionNames.tsv` | 關聯詞分類顯示名稱 |
 | `DataSource/AISyntheticBigram/common-unigram-supplement.tsv` | 經審閱的常用詞補償 |
-| `DataSource/AISyntheticBigram/common-phrase-unigram.tsv` | 完整詞補充，例如舊的 |
+| `DataSource/AISyntheticBigram/common-phrase-unigram.tsv` | 完整詞補充，`stage` 指定訓練前或訓練後寫入 |
 | `DataSource/AISyntheticBigram/search-trend-unigram-source.txt` | 搜尋詞原始清單，目前 550 詞 |
 | `DataSource/AISyntheticBigram/search-trend-reading-overrides.tsv` | 搜尋詞慣用讀音 |
 | `DataSource/AISyntheticBigram/collection-unigram-overrides.tsv` | 分類詞中文化／特殊讀音 |
@@ -54,10 +56,24 @@ Workflow：`.github/workflows/rebuild-keykey-db.yml`。
 搜尋與分類採用清單分別為 `search-trend-unigram.tsv`、`collection-unigram.tsv`。
 關聯詞表仍依原分類來源維護；本過濾規則針對自動組句 Unigram。
 
-普通 collection 新詞使用詞頻 1；搜尋詞頻依 2,300 篇的出現次數，範圍 1–100。
+台灣、港澳與中國用語的普通新增詞採用來源 TSV 的詞頻，其餘分類的普通新增詞使用詞頻 1。
+搜尋詞頻依 2,300 篇的出現次數，範圍 1–100。
 `SmartMandarinCooker.rb` 使用過濾後普通詞及 v2/v3/v4 共 2,300 篇建模，
 再套用既有 document-frequency、基本字保護與常用詞補償公式。
 131 篇驗證文章不參與 Bigram 建模。
+
+正式重建直接讀取 v2／v3／v4 的 JSONL 正文。全文以全型 `〖姓名〗` 標記人名，
+建模與文件頻率統計會跳過標記範圍，切斷兩側的詞語連接並保留原有句界。
+既有 `⟦姓名⟧` 也可讀取。巢狀、不成對或內容空白的標記會使建置停止並顯示行號。
+2,300 篇訓練文章共標記 30,081 處，131 篇驗證文章共標記 1,144 處。明德等單獨使用的名字也依上下文標記。搜尋詞的 Unigram 次數照原始正文計算，先移除起訖符號。
+
+`common-phrase-unigram.tsv` 中的 `pre-training` 詞條沿用原有審閱規則，
+「舊的」新增至訓練詞表，「新的」保留原詞頻。正式重建在 Bigram 及低順位詞處理完成後，
+先套用單音節指定組字的審閱權重，再依 `post-training` 列寫入或調整「另一位」等完整詞。
+這些詞按各自的 `target_count` 計分，只更新 Unigram。兩份來源皆綁入模型 manifest。
+
+`--training-articles` 可依序指定 v2／v3／v4 替代檔案供獨立重建。
+固定 131 篇的人名計分方式見[動作計分說明](../DataSource/AISyntheticBigram/TYPING_COST.md#排除人名的成本)。
 
 動漫詞與需降權的碰撞詞於普通詞與 Bigram 都完成後才加入，不參與斷詞、讀音證據或
 Bigram 邊。其詞頻最多為 0.01，且分數至少比既有完整同音詞低 2 個 log10 單位（100 倍）。
@@ -83,19 +99,24 @@ PR 驗證與合併後重建均先依鎖定 Rust 工具鏈及 `Cargo.lock` 編譯
 編譯成功才開始 cooker，後續回歸共用同一執行檔。
 每次建立獨立候選，驗證 SQLite、採用清單、來源雜湊、低順位候選分數與無 Bigram 邊，
 再跑完整 131 篇固定回歸。文章間不共享學習，讀音參考固定。
-總動作增加至多 30 次可採用；超過 30 次不採用。個別文章、核心／基本字變化只列診斷。
+正式門檻以目前共用 DB 為基準。兩組都排除已標註的人名及「她、他、時、十」的注音鍵與只修正這些位置的選字成本。同一次選字若也修到其他字，照常計入整次動作。
+排除後的總動作增加至多 30 次可採用。完整動作、個別文章及核心／基本字的差異保留在報告供診斷。
 驗證集至少包含 0001–0131，之後加入連續編號文章也會納入；排除 chat.md。
 此為固定回歸，不宣稱是新盲測。
 
-通過門檻後將 DB、採用／去重／降權／部分重疊清單、來源雜湊、cooker 報告、完整回歸結果、v5 最新紀錄、
-Android 快取檔名及各平台模型列數一起提交到工作分支，再開 PR 合併回 master。不存 DB artifact。
-只 stage `generated-files.json` 列出的檔案；一般平台 build 仍只驗證與複製共用 DB。
+通過門檻且符合自動開 PR 的條件時，將 DB、採用／去重／降權／部分重疊清單、來源雜湊、cooker 報告、
+完整回歸結果、v5 最新紀錄、Android 快取檔名及各平台模型列數一起提交到工作分支，再開 PR 合併回 master。
+只 stage `generated-files.json` 列出的檔案。一般平台 build 仍只驗證與複製共用 DB。
 
 所有新產生的 JSON 固定依 key 排序。發布判斷會比較 JSON 內容，欄位順序不同不算新結果；
 完整比較報告中，單獨的回歸引擎執行檔與量測程式雜湊變動也不觸發發布。
 manifest 中對這些報告的雜湊仍須正確綁定實際 bytes，僅在比較發布內容時改以正規化後的
-報告內容判斷。資料庫、來源雜湊、政策、逐篇與逐字結果仍納入比較，不能只因總動作差為 0
-就略過。舊報告若因已採用模型造成比較基線移動，仍保守保存新的回歸證據。
+報告內容判斷。資料庫、來源雜湊、政策、逐篇與逐字結果仍納入產物比較。
+舊報告若因已採用模型造成比較基線移動，仍保留新的回歸證據。
+
+固定回歸的正式總動作相同且顯示 `+0` 時，workflow 完成重建與驗證，在摘要記錄略過自動發布。
+此時略過建立 commit、推送分支及開 PR。仍需採用的 DB 或 manifest 變更可依本機重建的
+`--apply` 流程更新，再由維護者提交審查。
 
 沒有實質變更時，`generated-files.json` 為空清單，`--apply` 不改寫目前 checkout 的產物，
 workflow 不建立 commit、推送分支或開 PR。本次執行的完整報告仍保存在指定輸出目錄，
@@ -105,7 +126,7 @@ workflow 不建立 commit、推送分支或開 PR。本次執行的完整報告�
 直接沿用；已關閉或已合併的相同內容也不重新開 PR，避免重跑造成重複審查。
 新內容才建立新 PR；不覆寫既有遠端分支、不強制推送，也不自動關閉舊 run-id 分支的 PR。
 
-超過 30 次時仍成功產生 `rebuild-review/latest.json`、完整比較、候選採用／排除清單
+計分總動作超過門檻時仍成功產生 `rebuild-review/latest.json`、完整比較、候選採用／排除清單
 及 cooker 報告，僅將這些 review 檔提交到工作分支，再以 PR 合併。原 DB、manifest、正式清單、
 Android cache 及平台列數不動。驗證器以拒用報告中的原 DB 雜湊與當前來源雜湊綁定
 「來源已改、模型未採用」狀態，因此舊 DB 仍可建置；再改來源而未重建則驗證失敗。
@@ -150,7 +171,22 @@ python3 -B Source/Distributions/Takao/DatabaseCooker/rebuild-keykey-db.py \
 也可使用 `make -C Source/Distributions/Takao/DatabaseCooker rebuild-custom OUTPUT=/tmp/keykey-rebuild`。
 `--apply` 只更新 `generated-files.json` 中列出的產物，不 commit、push 或變更遠端。
 
-## 本次結果
+## 正式重建結果
+
+「台灣用語」收錄 1,368 筆詞條，包含 112 筆大專院校簡稱。另有 74 筆雙字常見名字，
+其中 22 筆沿用既有詞條，52 筆在 Bigram 訓練完成後加入 Unigram。
+「港澳用語」收錄 334 筆詞條，新增 299 筆 Unigram，35 筆沿用既有詞條。
+「中國用語」以繁體收錄 427 筆，相較前一版 DB 新增 285 筆 Unigram，142 筆已收錄。
+共用 DB 有 120,781 筆 Unigram、870,633 筆 Bigram，
+SHA-256 為 `16af45d4da0043d3e074523f130a0322aa1c9e7eb043b65bcaf7d819ac7841dd`。
+
+四份詞庫與補詞搬移合併後，相較 PR 115 原本的 DB，固定 131 篇正式計分由 318,423 次增為 318,425 次（+2），
+通過最多增加 30 次的採用門檻。正式計分有 2 篇改善、126 篇持平、3 篇退步。第 11、30 篇各少一次「瓶」的修正，
+第 47 篇多一次「記」的修正，第 48、128 篇各多一次「碼」的修正。每次修正各需 2 次操作。
+完整計分由 334,772 次降為 334,560 次（−212），17 篇改善、111 篇持平、3 篇退步。
+[逐篇與逐字回歸明細](../DataSource/AISyntheticBigram/collection-unigram-validation.json)
+
+## 先前分類詞庫重建
 
 第 131 篇由使用者新增，只供驗證，與訓練沒有整篇或 20 字以上相同段落。
 舊「碰撞即刪整詞」規則造成 131 篇 +69，其中第 131 篇 +65，因此未採用。

@@ -28,10 +28,10 @@ class AndroidRuntimeNoticeArguments(
         .flatMap { listOf("--android-runtime-artifact", it.absolutePath) }
 }
 
-val keyKeyVersionName = providers.gradleProperty("keykeyVersionName").getOrElse("1.5.0")
+val keyKeyVersionName = providers.gradleProperty("keykeyVersionName").getOrElse("1.5.1")
 val keyKeyVersionCode = providers.gradleProperty("keykeyVersionCode")
     .map(String::toInt)
-    .getOrElse(1_005_000)
+    .getOrElse(1_005_001)
 val releaseKeystorePath = providers.environmentVariable("ANDROID_KEYSTORE_PATH")
 val releaseKeystorePassword = providers.environmentVariable("ANDROID_KEYSTORE_PASSWORD")
 val releaseKeyAlias = providers.environmentVariable("ANDROID_KEY_ALIAS")
@@ -100,8 +100,9 @@ android {
             if (hasReleaseSigning) {
                 signingConfig = signingConfigs.getByName("release")
             }
-            isMinifyEnabled = false
-            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+            optimization {
+                enable = true
+            }
         }
     }
 
@@ -114,6 +115,7 @@ android {
     sourceSets["main"].assets.directories.add("build/generated/associatedPhraseIndexAssets")
     sourceSets["main"].assets.directories.add("build/generated/smartMandarinAssets")
     sourceSets["main"].assets.directories.add("build/generated/guanyinmaLicenseAssets")
+    sourceSets["main"].assets.directories.add("build/generated/simplifiedChineseAssets")
 }
 
 val guanyinmaCoreDirectory = layout.projectDirectory.dir("../../../Guanyinma")
@@ -273,7 +275,13 @@ val generateIndexedDictionaryAssets by tasks.registering(JavaExec::class) {
     outputs.dir(generatedIndexedDictionaryDirectory)
 }
 
+val generateSimplifiedChineseAssets by tasks.registering(Sync::class) {
+    from(layout.projectDirectory.file("../../Linux-IME/data/tc2sc.cin"))
+    into(layout.buildDirectory.dir("generated/simplifiedChineseAssets"))
+}
+
 tasks.named("preBuild").configure {
+    dependsOn(generateSimplifiedChineseAssets)
     dependsOn(generateGuanyinmaNotices)
     dependsOn(generateAssociatedPhraseAssets)
     dependsOn(generateIndexedDictionaryAssets)

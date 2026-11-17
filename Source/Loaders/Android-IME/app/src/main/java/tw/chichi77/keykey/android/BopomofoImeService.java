@@ -30,12 +30,16 @@ import java.util.concurrent.Executors;
 
 public final class BopomofoImeService extends InputMethodService
         implements BopomofoKeyboardView.Listener, FloatingCandidateWindow.Listener,
+        HardwareQuickSettingsWindow.Listener,
         SharedPreferences.OnSharedPreferenceChangeListener {
     private HostInputEngine engine;
     private String lastReportedCoreError;
     private boolean hostTransactionFailed;
+    private boolean simplifiedChineseOutput;
+    private SimplifiedChineseOutput simplifiedChineseConverter;
     private BopomofoKeyboardView keyboardView;
     private FloatingCandidateWindow floatingCandidateWindow;
+    private HardwareQuickSettingsWindow hardwareQuickSettings;
     private Vibrator vibrator;
     private Set<String> loadedPhraseCollections;
     private Set<String> pendingPhraseCollections;
@@ -77,6 +81,7 @@ public final class BopomofoImeService extends InputMethodService
     private int selectionMutationGeneration;
     private boolean awaitingOwnSelectionUpdate;
     private String appliedComposingText = "";
+    private boolean appliedTouchReading;
     private final TouchSmartHostTextState touchHostText = new TouchSmartHostTextState();
     private int composingRegionStart = -1;
     private int expectedSmartSelection = -1;
@@ -91,6 +96,7 @@ public final class BopomofoImeService extends InputMethodService
     @Override
     public void onCreate() {
         super.onCreate();
+        simplifiedChineseOutput = ChineseInputMethodSettings.simplifiedChineseOutput(this);
         openEngine();
         schedulePhraseDictionaryReload();
         vibrator = getSystemService(Vibrator.class);
@@ -111,6 +117,7 @@ public final class BopomofoImeService extends InputMethodService
                     BopomofoCompositionModeSettings.spaceSelectsCandidates(this),
                     BopomofoCompositionModeSettings.bigramEnabled(this),
                     CandidateGlyphSupport.shared()::canDisplay);
+            synchronizeTouchPhoneticGrid();
             // A recreated session has no FE association dictionary yet. Invalidate
             // old async callbacks and reload even when the selected sources match.
             phraseLoadGeneration++;
@@ -138,8 +145,10 @@ public final class BopomofoImeService extends InputMethodService
         // InputMethodService recreates this view during configuration changes.
         // Dispose the previous window before replacing its only owner reference.
         hideFloatingCandidates();
+        dismissHardwareQuickSettings();
         keyboardView = new BopomofoKeyboardView(this);
         keyboardView.setListener(this);
+        KeyboardInputView inputView = new KeyboardInputView(this, keyboardView);
         keyboardView.addOnAttachStateChangeListener(new View.OnAttachStateChangeListener() {
             @Override public void onViewAttachedToWindow(View view) {
                 if (view == keyboardView) updateKeyboardBottomControls();
@@ -156,10 +165,11 @@ public final class BopomofoImeService extends InputMethodService
             });
         }
         floatingCandidateWindow = new FloatingCandidateWindow(this, keyboardView, this);
+        hardwareQuickSettings = new HardwareQuickSettingsWindow(this, keyboardView, this);
         updateKeyboardMode();
         requestCursorAnchorUpdates();
         refreshKeyboard();
-        return new KeyboardInputView(this, keyboardView);
+        return inputView;
     }
 
     @Override
@@ -189,7 +199,10 @@ public final class BopomofoImeService extends InputMethodService
         super.onStartInput(attribute, restarting);
         if (engine == null) openEngine();
         stopHardwareBackspace();
-        if (!restarting) fieldPolicyUnlocked = false;
+        if (!restarting) {
+            dismissHardwareQuickSettings();
+            fieldPolicyUnlocked = false;
+        }
         resetCursorAnchor();
         lastSelectionStart = attribute == null ? -1 : attribute.initialSelStart;
         lastSelectionEnd = attribute == null ? -1 : attribute.initialSelEnd;
@@ -213,13 +226,16 @@ public final class BopomofoImeService extends InputMethodService
                 abandonHostEffects();
                 hostTransactionFailed = !releasedRange;
                 appliedComposingText = "";
+                appliedTouchReading = false;
                 touchHostText.reset();
                 composingRegionStart = -1;
                 expectedSmartSelection = -1;
                 if (engine != null) synchronizeInputPreferences();
             }
-            if (engine != null) engine.setAllowedInputModes(fieldPolicy.allowedModes(), fieldPolicy.preferredMode(),
-                    layoutChanged);
+            if (layoutChanged && appliedTouchReading) commitPendingComposition();
+            if (engine != null && !hostTransactionFailed) {
+                engine.setAllowedInputModes(fieldPolicy.allowedModes(), fieldPolicy.preferredMode(), layoutChanged);
+            }
         }
         updateKeyboardMode();
         requestCursorAnchorUpdates();
@@ -228,8 +244,10 @@ public final class BopomofoImeService extends InputMethodService
 
     /** A restarted InputConnection may have finished its old composing span. */
     private boolean restoreMarkedComposition() {
-        if (appliedComposingText.isEmpty() || engine.isTouchSmartComposition()
-                || !touchHostText.editableText().isEmpty()) return true;
+        if (appliedComposingText.isEmpty() || (!appliedTouchReading
+                && (engine.isTouchSmartComposition() || !touchHostText.editableText().isEmpty()))) {
+            return true;
+        }
         InputConnection connection = getCurrentInputConnection();
         if (connection == null || composingRegionStart < 0) return false;
         ExtractedText current = connection.getExtractedText(new ExtractedTextRequest(), 0);
@@ -245,12 +263,18 @@ public final class BopomofoImeService extends InputMethodService
                         || current.selectionStart > relativeEnd))
                 || !appliedComposingText.equals(current.text.subSequence(
                         (int) relativeStart, (int) relativeEnd).toString())) return false;
+        if (appliedTouchReading) {
+            String editable = touchHostText.editableText();
+            long editableStart = relativeStart - editable.length();
+            if (editableStart < 0 || !editable.contentEquals(current.text.subSequence(
+                    (int) editableStart, (int) relativeStart))) return false;
+        }
         int end = composingRegionStart + appliedComposingText.length();
         expectOwnSelectionUpdate();
         if (!connection.setComposingRegion(composingRegionStart, end)) return false;
         // EditorInfo can contain the field's original selection after rotation.
         // Restore the retained engine caret, rather than that stale position.
-        int caret = composingRegionStart + engine.composingCaretUtf16Offset();
+        int caret = appliedTouchReading ? end : composingRegionStart + engine.composingCaretUtf16Offset();
         if (caret < composingRegionStart || caret > end
                 || !connection.setSelection(caret, caret)) return false;
         lastSelectionStart = lastSelectionEnd = caret;
@@ -268,8 +292,10 @@ public final class BopomofoImeService extends InputMethodService
         boolean layoutChanged = !fieldPolicy.hasSameLayout(nextPolicy);
         fieldPolicy = nextPolicy;
         if (engine != null) {
-            if (engine != null) engine.setAllowedInputModes(fieldPolicy.allowedModes(), fieldPolicy.preferredMode(),
-                    layoutChanged);
+            if (layoutChanged && appliedTouchReading) commitPendingComposition();
+            if (engine != null && !hostTransactionFailed) {
+                engine.setAllowedInputModes(fieldPolicy.allowedModes(), fieldPolicy.preferredMode(), layoutChanged);
+            }
         }
         updateKeyboardMode();
         requestCursorAnchorUpdates();
@@ -278,6 +304,7 @@ public final class BopomofoImeService extends InputMethodService
 
     @Override
     public void onFinishInput() {
+        dismissHardwareQuickSettings();
         stopHardwareBackspace();
         commitPendingComposition();
         if (engine != null) abandonHostEffects();
@@ -289,6 +316,7 @@ public final class BopomofoImeService extends InputMethodService
         lastSelectionStart = -1;
         lastSelectionEnd = -1;
         appliedComposingText = "";
+        appliedTouchReading = false;
         touchHostText.reset();
         composingRegionStart = -1;
         expectedSmartSelection = -1;
@@ -300,12 +328,14 @@ public final class BopomofoImeService extends InputMethodService
 
     @Override
     public void onFinishInputView(boolean finishingInput) {
+        dismissHardwareQuickSettings();
         commitPendingComposition();
         super.onFinishInputView(finishingInput);
     }
 
     @Override
     public void onWindowHidden() {
+        dismissHardwareQuickSettings();
         stopHardwareBackspace();
         commitPendingComposition();
         hideFloatingCandidates();
@@ -330,6 +360,16 @@ public final class BopomofoImeService extends InputMethodService
         engine.setTableOptions(ChineseInputMethodSettings.options(this, engine.chineseInputMethod(), tableVirtualKeyboard));
         engine.setSpaceSelectsCandidates(BopomofoCompositionModeSettings.spaceSelectsCandidates(this));
         engine.setUseBigrams(BopomofoCompositionModeSettings.bigramEnabled(this));
+        synchronizeTouchPhoneticGrid();
+    }
+
+    private void synchronizeTouchPhoneticGrid() {
+        if (engine == null || hostTransactionFailed) return;
+        boolean enabled = !hardwareKeyboard && engine.chineseInputMethod() == ChineseInputMethod.SMART
+                && BopomofoCompositionModeSettings.omitTone(this);
+        if (enabled == engine.touchPhoneticGridEnabled()) return;
+        commitPendingComposition();
+        if (!hostTransactionFailed && !engine.hasComposition()) engine.setTouchPhoneticGrid(enabled);
     }
 
     private void abandonHostEffects() {
@@ -366,6 +406,7 @@ public final class BopomofoImeService extends InputMethodService
     @Override
     public void onDestroy() {
         destroying = true;
+        dismissHardwareQuickSettings();
         releaseCaptionController();
         stopHardwareBackspace();
         CandidateWindowSettings.preferences(this)
@@ -382,6 +423,7 @@ public final class BopomofoImeService extends InputMethodService
 
     @Override
     public void onConfigurationChanged(Configuration newConfig) {
+        dismissHardwareQuickSettings();
         hideFloatingCandidates();
         resetCursorAnchor();
         rebuildingForConfiguration = true;
@@ -424,6 +466,7 @@ public final class BopomofoImeService extends InputMethodService
                 : newSelStart != oldSelStart || newSelEnd != oldSelEnd;
         lastSelectionStart = newSelStart;
         lastSelectionEnd = newSelEnd;
+        int previousComposingStart = composingRegionStart;
         if (candidatesStart >= 0 && engine != null && engine.hasComposition()) {
             composingRegionStart = candidatesStart;
         }
@@ -433,17 +476,25 @@ public final class BopomofoImeService extends InputMethodService
                 && newSelEnd == expectedSmartSelection;
         if (expectedSmartCursor) expectedSmartSelection = -1;
 
-        if (awaitingOwnSelectionUpdate || expectedSmartCursor) {
-            return;
-        }
+        boolean atMarkedReadingEnd = candidatesStart >= 0
+                && newSelStart == candidatesEnd && newSelEnd == candidatesEnd;
+        if (expectedSmartCursor || (awaitingOwnSelectionUpdate
+                && (!appliedTouchReading || atMarkedReadingEnd))) return;
         if (!selectionChanged || engine == null
                 || (!engine.hasComposition() && engine.pageCount() == 0)) {
             return;
         }
 
-        commitPendingComposition();
-        engine.reset();
+        if (appliedTouchReading) {
+            releaseTouchReadingAfterCursorMove(previousComposingStart, candidatesStart, candidatesEnd,
+                    newSelStart, newSelEnd);
+            abandonHostEffects();
+        } else {
+            commitPendingComposition();
+            engine.reset();
+        }
         appliedComposingText = "";
+        appliedTouchReading = false;
         touchHostText.reset();
         composingRegionStart = -1;
         expectedSmartSelection = -1;
@@ -452,8 +503,46 @@ public final class BopomofoImeService extends InputMethodService
         refreshKeyboard();
     }
 
+    private void releaseTouchReadingAfterCursorMove(int previousStart, int start, int end,
+            int selectionStart, int selectionEnd) {
+        InputConnection connection = getCurrentInputConnection();
+        if (connection == null || previousStart < 0
+                || previousStart > Integer.MAX_VALUE - appliedComposingText.length()) return;
+        int previousEnd = previousStart + appliedComposingText.length();
+        if (start >= 0 && (start != previousStart || end != previousEnd)) return;
+        ExtractedText current = connection.getExtractedText(new ExtractedTextRequest(), 0);
+        if (current == null || current.text == null || current.startOffset < 0
+                || current.partialStartOffset >= 0) return;
+        int relativeStart = previousStart - current.startOffset;
+        int relativeEnd = previousEnd - current.startOffset;
+        if (relativeStart < 0 || relativeEnd > current.text.length()
+                || !appliedComposingText.contentEquals(current.text.subSequence(relativeStart, relativeEnd))) return;
+        expectOwnSelectionUpdate();
+        connection.beginBatchEdit();
+        try {
+            if (start < 0 && !connection.setComposingRegion(previousStart, previousEnd)) return;
+            if (connection.commitText("", 1) && selectionStart >= 0 && selectionEnd >= 0) {
+                int adjustedStart = selectionStart - Math.max(0, Math.min(selectionStart, previousEnd) - previousStart);
+                int adjustedEnd = selectionEnd - Math.max(0, Math.min(selectionEnd, previousEnd) - previousStart);
+                connection.setSelection(adjustedStart, adjustedEnd);
+            }
+        } finally {
+            connection.endBatchEdit();
+        }
+    }
+
     @Override
     public void onSharedPreferenceChanged(SharedPreferences preferences, String key) {
+        if (key == null || ChineseInputMethodSettings.KEY_SIMPLIFIED_CHINESE_OUTPUT.equals(key)) {
+            boolean enabled = ChineseInputMethodSettings.simplifiedChineseOutput(this);
+            if (enabled != simplifiedChineseOutput) {
+                // Finish with the old setting while it still owns the editable host suffix.
+                if (!hostTransactionFailed) commitPendingComposition();
+                simplifiedChineseOutput = enabled;
+                updateHardwareQuickSettings();
+            }
+            if (key != null) return;
+        }
         if (UserDataNotifications.KEY_CHANGED.equals(key)) {
             if (engine != null) apply(engine.refreshUserData());
             return;
@@ -464,6 +553,7 @@ public final class BopomofoImeService extends InputMethodService
                         BopomofoCompositionModeSettings.spaceSelectsCandidates(this));
                 if (key == null || key.startsWith("table_options.")) apply(engine.finishCompositionForModeSwitch());
                 apply(engine.setChineseInputMethod(ChineseInputMethodSettings.method(this)));
+                synchronizeTouchPhoneticGrid();
                 engine.setTableOptions(ChineseInputMethodSettings.options(this, engine.chineseInputMethod(), tableVirtualKeyboard));
             }
             refreshKeyboard();
@@ -471,6 +561,7 @@ public final class BopomofoImeService extends InputMethodService
         }
         if (BopomofoKeyboardLayoutSettings.KEY_LAYOUT.equals(key)) {
             if (engine != null) apply(engine.setKeyboardLayout(BopomofoKeyboardLayoutSettings.layout(this)));
+            synchronizeTouchPhoneticGrid();
             refreshKeyboard();
             return;
         }
@@ -484,6 +575,12 @@ public final class BopomofoImeService extends InputMethodService
                 apply(engine.setChineseInputMethod(ChineseInputMethodSettings.method(this)));
                 engine.setTableOptions(ChineseInputMethodSettings.options(this, engine.chineseInputMethod(), tableVirtualKeyboard));
             }
+            synchronizeTouchPhoneticGrid();
+            refreshKeyboard();
+            return;
+        }
+        if (BopomofoCompositionModeSettings.KEY_OMIT_TONE.equals(key)) {
+            synchronizeTouchPhoneticGrid();
             refreshKeyboard();
             return;
         }
@@ -541,6 +638,7 @@ public final class BopomofoImeService extends InputMethodService
 
     @Override
     public void onKey(String key) {
+        if (!key.equals("HARDWARE_LANGUAGE")) dismissHardwareQuickSettings();
         if (key.equals("DISMISS")) {
             if (finishCompositionForKeyboardHide()) requestHideSelf(0);
             return;
@@ -572,14 +670,14 @@ public final class BopomofoImeService extends InputMethodService
             return;
         }
         if (key.equals("SETTINGS")) {
-            apply(engine.finishCompositionForModeSwitch());
-            Intent intent = new Intent(this, SettingsActivity.class);
-            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-            startActivity(intent);
+            openKeyboardSettings();
             return;
         }
         if (key.equals("HARDWARE_LANGUAGE")) {
-            apply(engine.toggleHardwareLanguage());
+            if (canUseHardwareQuickSettings()) {
+                hardwareQuickSettings.toggle(simplifiedChineseOutput, engine.chineseInputMethod(),
+                        engine.inputMode() != InputEngine.InputMode.BOPOMOFO, engine.isHardwareFullWidth());
+            }
             return;
         }
         if (key.equals("HARDWARE_WIDTH")) {
@@ -594,17 +692,76 @@ public final class BopomofoImeService extends InputMethodService
         }
         if (!fieldPolicy.isKeyEnabled(key, engine.inputMode(), engine.isShifted())) return;
         useTableKeyboard(!hardwareKeyboard);
-        apply(engine.handleSoftKey(key), key.equals("ENTER"));
+        boolean omitTone = keyboardView != null && keyboardView.isTouchMode()
+                && engine.usesTouchPhoneticGrid();
+        apply(engine.handleSoftKey(key, omitTone), key.equals("ENTER"));
+    }
+
+    @Override
+    public void openKeyboardSettings() {
+        if (engine == null || hostTransactionFailed) return;
+        dismissHardwareQuickSettings();
+        apply(engine.finishCompositionForModeSwitch());
+        Intent intent = new Intent(this, SettingsActivity.class);
+        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+        startActivity(intent);
+    }
+
+    @Override
+    public void onScriptToggle() {
+        if (canUseHardwareQuickSettings()) {
+            ChineseInputMethodSettings.setSimplifiedChineseOutput(this, !simplifiedChineseOutput);
+        }
+    }
+
+    @Override
+    public void onInputModeSelected(ChineseInputMethod method) {
+        if (!canUseHardwareQuickSettings()) return;
+        engine.prepareForHardwareInput();
+        if (method != null && method != engine.chineseInputMethod()) {
+            ChineseInputMethodSettings.setMethod(this, method);
+        }
+        boolean wantsEnglish = method == null;
+        boolean english = engine.inputMode() != InputEngine.InputMode.BOPOMOFO;
+        if (!hostTransactionFailed && wantsEnglish != english) {
+            apply(engine.toggleHardwareLanguage());
+        }
+    }
+
+    @Override
+    public void onWidthToggle() {
+        if (canUseHardwareQuickSettings()) apply(engine.toggleHardwareWidth());
+    }
+
+    private boolean canUseHardwareQuickSettings() {
+        return hardwareQuickSettings != null && keyboardView.mode() == BopomofoKeyboardView.Mode.HARDWARE
+                && !hardwareCandidatesCollapsed && engine != null && !hostTransactionFailed;
+    }
+
+    private void updateHardwareQuickSettings() {
+        if (hardwareQuickSettings == null || !hardwareQuickSettings.isShowing()) return;
+        if (!canUseHardwareQuickSettings()) {
+            dismissHardwareQuickSettings();
+            return;
+        }
+        hardwareQuickSettings.update(simplifiedChineseOutput, engine.chineseInputMethod(),
+                engine.inputMode() != InputEngine.InputMode.BOPOMOFO, engine.isHardwareFullWidth());
+    }
+
+    private void dismissHardwareQuickSettings() {
+        if (hardwareQuickSettings != null) hardwareQuickSettings.dismiss();
     }
 
     @Override
     public void onCandidate(int displayedIndex) {
+        dismissHardwareQuickSettings();
         if (engine == null || hostTransactionFailed) return;
         apply(engine.selectDisplayedCandidate(displayedIndex));
     }
 
     @Override
     public void onSmartCell(int index) {
+        dismissHardwareQuickSettings();
         if (engine == null || hostTransactionFailed) return;
         if (engine.selectTouchSmartCell(index)) refreshKeyboard();
     }
@@ -620,6 +777,7 @@ public final class BopomofoImeService extends InputMethodService
 
     @Override
     public void onPage(int delta) {
+        dismissHardwareQuickSettings();
         if (engine == null || hostTransactionFailed) return;
         engine.changePage(delta);
         refreshKeyboard();
@@ -643,10 +801,12 @@ public final class BopomofoImeService extends InputMethodService
         }
         // A key can arrive before the hardware configuration callback. Finish
         // the already-inserted touch tail before adopting marked host text.
-        if (!hardwareSmartTwoRows && !touchHostText.editableText().isEmpty()
+        if ((engine.hasPendingPhoneticReading()
+                || (!hardwareSmartTwoRows && !touchHostText.editableText().isEmpty()))
                 && !KeyEvent.isModifierKey(keyCode) && keyCode != KeyEvent.KEYCODE_CAPS_LOCK
                 && keyCode != KeyEvent.KEYCODE_NUM_LOCK && keyCode != KeyEvent.KEYCODE_SCROLL_LOCK) {
             commitPendingComposition();
+            if (hostTransactionFailed || engine.hasPendingPhoneticReading()) return true;
         }
         useTableKeyboard(false);
         if (keyCode == KeyEvent.KEYCODE_DEL && hardwareBackspaceHeld) return true;
@@ -859,7 +1019,7 @@ public final class BopomofoImeService extends InputMethodService
 
     private boolean applyToConnection(InputConnection connection, InputEngine.Result result,
                                       boolean softEnter) {
-        if (engine.isTouchSmartComposition() || !touchHostText.editableText().isEmpty()) {
+        if (engine.isTouchSmartComposition() || appliedTouchReading || !touchHostText.editableText().isEmpty()) {
             return applyTouchSmart(connection, result, softEnter);
         }
         boolean accepted = true;
@@ -879,7 +1039,7 @@ public final class BopomofoImeService extends InputMethodService
         try {
             if (result.deleteBeforeCursor()) accepted &= deletePreviousGrapheme(connection);
             if (committedText) {
-                accepted &= connection.commitText(result.committedText(), 1);
+                accepted &= connection.commitText(convertOutput(result.committedText()), 1);
                 composingRegionStart = -1;
             }
             if (result.discardComposingText()) {
@@ -935,34 +1095,62 @@ public final class BopomofoImeService extends InputMethodService
         return accepted;
     }
 
+    private String convertOutput(String text) {
+        if (!simplifiedChineseOutput || text.isEmpty()) return text;
+        if (simplifiedChineseConverter == null) {
+            simplifiedChineseConverter = SimplifiedChineseOutput.load(getAssets());
+        }
+        return simplifiedChineseConverter.convert(text);
+    }
+
     private boolean applyTouchSmart(InputConnection connection, InputEngine.Result result,
                                     boolean softEnter) {
         boolean accepted = true;
+        String committedText = convertOutput(result.committedText());
         TouchSmartHostTextState.Edit edit;
         if (engine.isTouchSmartComposition() && engine.hasComposition()) {
-            edit = touchHostText.update(engine.completedSmartText(), result.committedText());
-        } else if (engine.isTouchSmartComposition() && result.committedText().isEmpty()
+            edit = touchHostText.update(convertOutput(engine.completedSmartText()), committedText);
+        } else if (engine.isTouchSmartComposition() && committedText.isEmpty()
                 && !result.deleteBeforeCursor() && !result.sendEnter()) {
             edit = touchHostText.cancel();
         } else {
-            edit = touchHostText.finish(result.committedText());
+            edit = touchHostText.finish(committedText);
         }
 
-        boolean changesSelection = !edit.isEmpty() || result.deleteBeforeCursor()
-                || result.sendEnter();
-        if (changesSelection) expectOwnSelectionUpdate();
+        String rawReading = engine.usesTouchPhoneticGrid() && engine.hasPendingPhoneticReading()
+                ? engine.readingText() : "";
+        boolean editTail = !edit.isEmpty() || result.deleteBeforeCursor();
+        boolean removeReading = !appliedComposingText.isEmpty()
+                && (!appliedTouchReading || editTail || rawReading.isEmpty());
+        boolean updateReading = !rawReading.isEmpty()
+                && (removeReading || !rawReading.equals(appliedComposingText));
+        int readingStart = appliedComposingText.isEmpty()
+                ? Math.min(lastSelectionStart, lastSelectionEnd) : composingRegionStart;
+        if (readingStart >= edit.deleteCount() && !result.deleteBeforeCursor()) {
+            readingStart += edit.insertion().length() - edit.deleteCount();
+        } else {
+            readingStart = -1;
+        }
+        if (editTail || removeReading || updateReading || result.sendEnter()) expectOwnSelectionUpdate();
         connection.beginBatchEdit();
         try {
-            if (!appliedComposingText.isEmpty()) {
-                accepted &= connection.commitText("", 1);
+            if (removeReading) {
+                if (!connection.commitText("", 1)) return false;
                 appliedComposingText = "";
+                appliedTouchReading = false;
                 composingRegionStart = -1;
             }
-            if (edit.deleteCount() > 0) {
-                accepted &= connection.deleteSurroundingText(edit.deleteCount(), 0);
+            if (edit.deleteCount() > 0 && !connection.deleteSurroundingText(edit.deleteCount(), 0)) {
+                return false;
             }
-            if (!edit.insertion().isEmpty()) accepted &= connection.commitText(edit.insertion(), 1);
-            if (result.deleteBeforeCursor()) accepted &= deletePreviousGrapheme(connection);
+            if (!edit.insertion().isEmpty() && !connection.commitText(edit.insertion(), 1)) return false;
+            if (result.deleteBeforeCursor() && !deletePreviousGrapheme(connection)) return false;
+            if (updateReading) {
+                if (!connection.setComposingText(rawReading, 1)) return false;
+                composingRegionStart = readingStart;
+                appliedComposingText = rawReading;
+                appliedTouchReading = true;
+            }
         } finally {
             connection.endBatchEdit();
         }
@@ -1026,6 +1214,9 @@ public final class BopomofoImeService extends InputMethodService
                 && engine.compositionMode() == BopomofoCompositionMode.SMART
                 && engine.inputMode() == InputEngine.InputMode.BOPOMOFO;
         keyboardView.setAssociatedPhrasesVisible(engine.isShowingAssociatedPhrases());
+        boolean phoneticPending = engine.hasPendingPhoneticReading();
+        keyboardView.setPhoneticState(keyboardView.isTouchMode() && engine.usesTouchPhoneticGrid(),
+                phoneticPending, engine.phoneticSpaceFirstTone());
         keyboardView.setState(engine.displayedCandidates(), engine.composingText(),
                 engine.compositionMode() == BopomofoCompositionMode.SMART
                         && engine.inputMode() == InputEngine.InputMode.BOPOMOFO,
@@ -1035,6 +1226,7 @@ public final class BopomofoImeService extends InputMethodService
                 engine.isHardwareFullWidth(), supportPromptVisible,
                 engine.page(), engine.pageCount(),
                 engine.isShowingAssociatedPhrases() ? -1 : engine.highlightedIndex(), fieldPolicy);
+        updateHardwareQuickSettings();
         if (isFloatingCandidateMode() && floatingCandidateWindow != null) {
             boolean candidatesVisible = !engine.displayedCandidates().isEmpty();
             boolean openingCandidates = candidatesVisible && !floatingCandidatesVisible;
@@ -1091,9 +1283,9 @@ public final class BopomofoImeService extends InputMethodService
 
     private void updateKeyboardSize() {
         if (keyboardView == null) return;
-        keyboardView.setTouchKeyboardHeightPercents(
-                KeyboardSizeSettings.portraitPercent(this),
-                KeyboardSizeSettings.landscapePercent(this));
+        keyboardView.setTouchKeyboardSizes(
+                KeyboardSizeSettings.size(this, false),
+                KeyboardSizeSettings.size(this, true));
     }
 
     private void updateKeyboardBottomSpace() {
@@ -1196,6 +1388,7 @@ public final class BopomofoImeService extends InputMethodService
                 && engine.isTouchSmartComposition() != (!hardwareKeyboard || nextSmartTwoRows);
         if (nextSmartTwoRows != hardwareSmartTwoRows || strategyChanged) commitPendingComposition();
         hardwareSmartTwoRows = nextSmartTwoRows;
+        synchronizeTouchPhoneticGrid();
         if (engine != null) {
             engine.setHardwareTouchSmartEditing(hardwareSmartTwoRows);
             engine.setHardwareSmartEditing(hardwareKeyboard && !hardwareSmartTwoRows);
@@ -1204,15 +1397,17 @@ public final class BopomofoImeService extends InputMethodService
         updateKeyboardBottomSpace();
         keyboardView.setHardwareSmartTwoRowsEnabled(hardwareSmartTwoRows);
         keyboardView.setHardwareNumberRowEnabled(CandidateWindowSettings.numberRowEnabled(this));
+        BopomofoKeyboardView.Mode nextMode;
         if (hardwareKeyboard) {
-            keyboardView.setMode(isFloatingCandidateMode()
+            nextMode = isFloatingCandidateMode()
                     ? BopomofoKeyboardView.Mode.HARDWARE_FLOATING
-                    : BopomofoKeyboardView.Mode.HARDWARE);
-        } else if (configuration.orientation == Configuration.ORIENTATION_LANDSCAPE) {
-            keyboardView.setMode(BopomofoKeyboardView.Mode.LANDSCAPE);
+                    : BopomofoKeyboardView.Mode.HARDWARE;
         } else {
-            keyboardView.setMode(BopomofoKeyboardView.Mode.PORTRAIT);
+            nextMode = configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
+                    ? BopomofoKeyboardView.Mode.LANDSCAPE : BopomofoKeyboardView.Mode.PORTRAIT;
         }
+        keyboardView.setMode(nextMode);
+        if (nextMode != BopomofoKeyboardView.Mode.HARDWARE) dismissHardwareQuickSettings();
         if (!isFloatingCandidateMode()) hideFloatingCandidates();
         updateKeyboardBottomControls();
     }

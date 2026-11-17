@@ -4,7 +4,7 @@ import sqlite3
 import tempfile
 import unittest
 
-from phrase_unigram_supplement import apply, query_for_reading, strongest_competitor
+from phrase_unigram_supplement import POST_TRAINING, apply, query_for_reading, strongest_competitor, verify_post_training
 
 
 class WholePhraseTests(unittest.TestCase):
@@ -49,6 +49,95 @@ class WholePhraseTests(unittest.TestCase):
         self.db.execute("INSERT INTO unigrams VALUES(?,?,?,0)", (self.q1 + self.q2, "舊的", -3))
         with self.assertRaisesRegex(ValueError, "existing phrase changed"):
             apply(self.db, self.path, 1000)
+
+    def test_post_training_entries_preserve_reviewed_counts_without_bigrams(self):
+        header, pre_training = self.path.read_text(encoding="utf-8").splitlines()
+        self.path.write_text(f"{header}\tstage\n{pre_training}\tpre-training\n"
+                             "舊了\t306\tㄐㄧㄡˋ ㄌㄜ˙\t4\t3\treviewed phrase\tpost-training\n",
+                             encoding="utf-8")
+        bigrams = self.db.execute("SELECT * FROM bigrams").fetchall()
+        self.assertEqual([row["word"] for row in apply(self.db, self.path, 1000)], ["舊的"])
+        self.assertIsNone(self.db.execute("SELECT 1 FROM unigrams WHERE current='舊了'").fetchone())
+        result = apply(self.db, self.path, 1000, stage=POST_TRAINING)
+        self.assertEqual([row["word"] for row in result], ["舊了"])
+        self.assertEqual(self.db.execute("SELECT probability,backoff FROM unigrams WHERE current='舊了'").fetchone(),
+                         (math.log10(306 / 1000), 0.0))
+        self.assertEqual(self.db.execute("SELECT * FROM bigrams").fetchall(), bigrams)
+        verify_post_training(self.db, self.path, 1000, 1)
+        phrase_query = self.q1 + query_for_reading("ㄌㄜ˙")
+        self.db.execute("INSERT INTO bigrams VALUES(?,?,?,?)", (f"! {phrase_query}", "", "舊了", -.1))
+        with self.assertRaisesRegex(ValueError, "has a Bigram edge"):
+            verify_post_training(self.db, self.path, 1000, 1)
+
+    def test_post_training_alternate_reading_preserves_existing_reading_and_edges(self):
+        header = self.path.read_text(encoding="utf-8").splitlines()[0]
+        self.path.write_text(f"{header}\tstage\n"
+                             "不想\t0.01\tㄅㄨˊ ㄒㄧㄤˇ\t4\t3\treviewed reading\tpost-training\n",
+                             encoding="utf-8")
+        final = query_for_reading("ㄒㄧㄤˇ")
+        canonical = query_for_reading("ㄅㄨˋ") + final
+        alternate = query_for_reading("ㄅㄨˊ") + final
+        canonical_row = (canonical, "不想", -2., -.3)
+        canonical_edge = (f"! {canonical}", "", "不想", -.4)
+        self.db.execute("INSERT INTO unigrams VALUES(?,?,?,?)", canonical_row)
+        self.db.execute("INSERT INTO bigrams VALUES(?,?,?,?)", canonical_edge)
+
+        apply(self.db, self.path, 1000, stage=POST_TRAINING)
+        verify_post_training(self.db, self.path, 1000, 1)
+        self.assertCountEqual(self.db.execute("SELECT * FROM unigrams WHERE current='不想'").fetchall(),
+                              [canonical_row, (alternate, "不想", math.log10(0.01 / 1000), 0.)])
+        self.assertEqual(self.db.execute("SELECT * FROM bigrams WHERE current='不想'").fetchall(),
+                         [canonical_edge])
+        for edge in [(f"! {alternate}", "", "不想", -.4),
+                     (f"{alternate} {self.q2}", "不想", "的", -.4)]:
+            with self.subTest(edge=edge):
+                self.db.execute("INSERT INTO bigrams VALUES(?,?,?,?)", edge)
+                with self.assertRaisesRegex(ValueError, "has a Bigram edge"):
+                    verify_post_training(self.db, self.path, 1000, 1)
+                self.db.execute("DELETE FROM bigrams WHERE qstring=?", (edge[0],))
+
+    def test_no_training_occurrences_allowed_only_for_post_training_additions(self):
+        header = self.path.read_text(encoding="utf-8").splitlines()[0]
+        for stage, occurrences, documents in ((POST_TRAINING, 0, 0),
+                                              ("pre-training", 0, 0),
+                                              (POST_TRAINING, 1, 0)):
+            with self.subTest(stage=stage, occurrences=occurrences, documents=documents):
+                self.path.write_text(f"{header}\tstage\n"
+                                     f"舊的\t11\tㄐㄧㄡˋ ㄉㄜ˙\t{occurrences}\t{documents}\trequested phrase\t{stage}\n",
+                                     encoding="utf-8")
+                if (stage, occurrences, documents) == (POST_TRAINING, 0, 0):
+                    self.assertEqual(apply(self.db, self.path, 1000, stage=stage)[0]["status"], "inserted")
+                    verify_post_training(self.db, self.path, 1000, 1)
+                else:
+                    with self.assertRaisesRegex(ValueError, "missing evidence"):
+                        apply(self.db, self.path, 1000, stage=stage)
+
+    def test_reviewed_reweight_updates_only_the_existing_reading_probability(self):
+        header = self.path.read_text(encoding="utf-8").splitlines()[0]
+        self.path.write_text(f"{header}\tstage\taction\n"
+                             "十個\t296\tㄕˊ ㄍㄜˋ\t38\t37\treviewed count\tpost-training\treweight\n",
+                             encoding="utf-8")
+        query = query_for_reading("ㄕˊ") + query_for_reading("ㄍㄜˋ")
+        other = query_for_reading("ㄕˊ") + query_for_reading("ㄍㄜ˙")
+        with self.assertRaisesRegex(ValueError, "expected an existing phrase to reweight"):
+            apply(self.db, self.path, 1000, stage=POST_TRAINING)
+        self.db.executemany("INSERT INTO unigrams VALUES(?,?,?,?)",
+                            [(query, "十個", -3., -.2), (other, "十個", -4., -.2)])
+        edge = (f"! {query}", "", "十個", -.4)
+        self.db.execute("INSERT INTO bigrams VALUES(?,?,?,?)", edge)
+        result = apply(self.db, self.path, 1000, stage=POST_TRAINING)
+        self.assertEqual(result[0]["status"], "reweighted")
+        self.assertCountEqual(self.db.execute("SELECT * FROM unigrams WHERE current='十個'").fetchall(),
+                              [(query, "十個", math.log10(.296), -.2), (other, "十個", -4., -.2)])
+        self.assertEqual(self.db.execute("SELECT * FROM bigrams WHERE current='十個'").fetchall(), [edge])
+        verify_post_training(self.db, self.path, 1000, 1)
+
+    def test_invalid_stage_rejected_before_applying_any_entry(self):
+        header, phrase = self.path.read_text(encoding="utf-8").splitlines()
+        self.path.write_text(f"{header}\tstage\n{phrase}\ttraining\n", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "invalid phrase supplement stage"):
+            apply(self.db, self.path, 1000)
+        self.assertIsNone(self.db.execute("SELECT 1 FROM unigrams WHERE current='舊的'").fetchone())
 
     def test_invalid_reading_rejected(self):
         for reading in ("", "ˋ", "ㄐㄐ", "invalid"):

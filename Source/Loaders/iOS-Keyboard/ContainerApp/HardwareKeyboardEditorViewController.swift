@@ -74,15 +74,20 @@ fileprivate final class HardwareKeyboardCaptureView: UIView {
 
 fileprivate final class ClearConfirmationOverlayView: UIView {}
 
-private final class PhraseCollectionPickerViewController: UITableViewController {
+final class PhraseCollectionPickerViewController: UITableViewController {
     private let collections: [AssociatedPhraseStore.Collection]
     private var enabled: Set<String>
+    private let accessibilityPrefix: String
     var didChange: ((Set<String>) -> Void)?
     var didClose: (() -> Void)?
 
-    init(collections: [AssociatedPhraseStore.Collection], enabled: Set<String>) {
+    init(
+        collections: [AssociatedPhraseStore.Collection], enabled: Set<String>,
+        accessibilityPrefix: String
+    ) {
         self.collections = collections
         self.enabled = enabled
+        self.accessibilityPrefix = accessibilityPrefix
         super.init(style: .insetGrouped)
     }
 
@@ -97,7 +102,7 @@ private final class PhraseCollectionPickerViewController: UITableViewController 
             barButtonSystemItem: .done, target: self, action: #selector(close)
         )
         navigationItem.rightBarButtonItem?.accessibilityIdentifier =
-            "hardware-editor.phrases.done"
+            "\(accessibilityPrefix).done"
         tableView.allowsMultipleSelection = true
     }
 
@@ -127,12 +132,12 @@ private final class PhraseCollectionPickerViewController: UITableViewController 
             let identifiers = ["all", "base-only", "none"]
             content.text = choices[indexPath.row]
             content.textProperties.color = .systemPurple
-            cell.accessibilityIdentifier = "hardware-editor.phrases.\(identifiers[indexPath.row])"
+            cell.accessibilityIdentifier = "\(accessibilityPrefix).\(identifiers[indexPath.row])"
             cell.accessoryType = .disclosureIndicator
         } else {
             let collection = collections[indexPath.row]
             content.text = collection.display
-            cell.accessibilityIdentifier = "hardware-editor.phrases.\(collection.source)"
+            cell.accessibilityIdentifier = "\(accessibilityPrefix).\(collection.source)"
             cell.accessoryType = enabled.contains(collection.source) ? .checkmark : .none
         }
         cell.contentConfiguration = content
@@ -184,6 +189,7 @@ final class HardwareKeyboardEditorViewController: UIViewController {
     private let compositionModeButton = UIButton(configuration: .tinted())
     private let keyboardLayoutButton = UIButton(configuration: .tinted())
     private let phraseButton = UIButton(configuration: .tinted())
+    private let outputScriptButton = UIButton(configuration: .tinted())
     private let modeButton = UIButton(configuration: .tinted())
     private let widthButton = UIButton(configuration: .tinted())
     private let symbolButton = UIButton(configuration: .tinted())
@@ -235,6 +241,7 @@ final class HardwareKeyboardEditorViewController: UIViewController {
     )
     private lazy var phraseSettings = PhraseSettings(sharedDefaults: sharedDefaults)
     private lazy var methodSettings = ChineseInputMethodSettings(sharedDefaults: sharedDefaults)
+    private lazy var simplifiedOutputSettings = SimplifiedChineseOutputSettings(sharedDefaults: sharedDefaults)
     private lazy var compositionModeSettings = BopomofoCompositionModeSettings(
         sharedDefaults: sharedDefaults
     )
@@ -656,6 +663,8 @@ final class HardwareKeyboardEditorViewController: UIViewController {
     }
 
     private func makeModeControlPanel() -> UIView {
+        outputScriptButton.accessibilityIdentifier = "hardware-editor.output-script"
+        outputScriptButton.addTarget(self, action: #selector(changeOutputScript), for: .touchUpInside)
         modeButton.accessibilityIdentifier = "hardware-editor.mode"
         modeButton.addTarget(self, action: #selector(changeMode), for: .touchUpInside)
         widthButton.accessibilityIdentifier = "hardware-editor.width"
@@ -668,7 +677,7 @@ final class HardwareKeyboardEditorViewController: UIViewController {
         emojiButton.accessibilityLabel = "表情符號"
         emojiButton.addTarget(self, action: #selector(showEmojis), for: .touchUpInside)
 
-        for button in [modeButton, widthButton, symbolButton, emojiButton] {
+        for button in [outputScriptButton, modeButton, widthButton, symbolButton, emojiButton] {
             button.configuration?.buttonSize = .small
             button.setContentCompressionResistancePriority(.required, for: .horizontal)
             let height = button.heightAnchor.constraint(equalToConstant: 38)
@@ -676,7 +685,7 @@ final class HardwareKeyboardEditorViewController: UIViewController {
             compactableButtonHeightConstraints.append(height)
         }
 
-        let firstRow = UIStackView(arrangedSubviews: [UIView(), modeButton, widthButton])
+        let firstRow = UIStackView(arrangedSubviews: [outputScriptButton, modeButton, widthButton])
         let secondRow = UIStackView(arrangedSubviews: [UIView(), symbolButton, emojiButton])
         for row in [firstRow, secondRow] {
             row.axis = .horizontal
@@ -1073,6 +1082,10 @@ final class HardwareKeyboardEditorViewController: UIViewController {
 
     private func refresh() {
         refreshSupporterPrompt()
+        let simplified = simplifiedOutputSettings.enabled
+        outputScriptButton.setTitle(simplified ? "簡" : "繁", for: .normal)
+        outputScriptButton.accessibilityLabel = simplified
+            ? "目前簡體，切換繁體" : "目前繁體，切換簡體"
         insertionCharacterIndex = min(max(insertionCharacterIndex, 0), committedText.count)
         let insertionIndex = committedText.index(
             committedText.startIndex, offsetBy: insertionCharacterIndex
@@ -1256,7 +1269,8 @@ final class HardwareKeyboardEditorViewController: UIViewController {
         }
         if result.deletesBackward { deleteCommittedCharacterBackward() }
         if !result.text.isEmpty {
-            insertCommittedText(widenASCII ? fullWidth(result.text) : result.text)
+            let text = simplifiedOutputSettings.convertOutputText(result.text)
+            insertCommittedText(widenASCII ? fullWidth(text) : text)
         }
         if result.sendsReturn { insertCommittedText("\n") }
         transientStatus = nil
@@ -1314,6 +1328,12 @@ final class HardwareKeyboardEditorViewController: UIViewController {
         restoreCaptureFocusAfterControlAction()
     }
 
+    @objc private func changeOutputScript() {
+        simplifiedOutputSettings.setEnabled(!simplifiedOutputSettings.enabled)
+        refresh()
+        restoreCaptureFocusAfterControlAction()
+    }
+
     private func selectInputMethod(_ method: ChineseInputMethod) {
         guard let engine else { return }
         apply(engine.setChineseInputMethod(method))
@@ -1329,7 +1349,8 @@ final class HardwareKeyboardEditorViewController: UIViewController {
         _ = captureView.resignFirstResponder()
         let picker = PhraseCollectionPickerViewController(
             collections: collections,
-            enabled: phraseSettings.enabledCollections.intersection(Set(collections.map(\.source)))
+            enabled: phraseSettings.enabledCollections.intersection(Set(collections.map(\.source))),
+            accessibilityPrefix: "hardware-editor.phrases"
         )
         picker.didChange = { [weak self] selection in
             self?.applyPhraseSelection(selection)
